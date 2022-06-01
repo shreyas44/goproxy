@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/net/http2"
 )
 
 type ConnectActionLiteral int
@@ -68,6 +70,19 @@ func stripPort(s string) string {
 
 	}
 	return s[:ix]
+}
+
+func preprocessHttpsRequest(ctx *ProxyCtx, connectReq, req *http.Request) {
+	req.RemoteAddr = connectReq.RemoteAddr // since we're converting the request, need to carry over the original connecting IP as well
+	ctx.Logf("req %v", connectReq.Host)
+
+	if !httpsRegexp.MatchString(req.URL.String()) {
+		req.URL, _ = url.Parse("https://" + connectReq.Host + req.URL.String())
+	}
+
+	// Bug fix which goproxy fails to provide request
+	// information URL in the context when does HTTPS MITM
+	ctx.Req = req
 }
 
 func (proxy *ProxyHttpServer) dial(network, addr string) (c net.Conn, err error) {
@@ -211,6 +226,54 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				return
 			}
 			defer rawClientTls.Close()
+
+			if rawClientTls.ConnectionState().NegotiatedProtocol == "h2" {
+				server := &http2.Server{}
+				server.ServeConn(rawClientTls, &http2.ServeConnOpts{
+					Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+						var err error
+						ctx := &ProxyCtx{Req: req, Session: atomic.AddInt64(&proxy.sess, 1), Proxy: proxy, UserData: ctx.UserData}
+						preprocessHttpsRequest(ctx, r, req)
+
+						req, resp := proxy.filterRequest(req, ctx)
+						if resp == nil {
+							// TODO: support websocket requests
+							if !proxy.KeepHeader {
+								removeProxyHeaders(ctx, req)
+							}
+
+							resp, err = ctx.RoundTrip(req)
+							if err != nil {
+								ctx.Warnf("warn resp: %v", resp)
+								ctx.Warnf("warn req: %v", ctx.RoundTrip)
+								ctx.Warnf("Cannot read response from mitm'd server %v", err)
+								return
+							}
+							ctx.Logf("resp %v", resp.Status)
+						}
+						resp = proxy.filterResponse(resp, ctx)
+						defer resp.Body.Close()
+
+						for k, values := range resp.Header {
+							for _, val := range values {
+								w.Header().Add(k, val)
+							}
+						}
+
+						w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+						w.WriteHeader(resp.StatusCode)
+
+						// Don't write out a response body for HEAD request
+						if resp.Request.Method != "HEAD" {
+							if _, err := io.Copy(w, resp.Body); err != nil {
+								ctx.Warnf("Cannot write response body from mitm'd client: %v", err)
+							}
+						}
+					}),
+				})
+				return
+			}
+
 			clientTlsReader := bufio.NewReader(rawClientTls)
 			for !isEof(clientTlsReader) {
 				req, err := http.ReadRequest(clientTlsReader)
@@ -222,17 +285,8 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					ctx.Warnf("Cannot read TLS request from mitm'd client %v %v", r.Host, err)
 					return
 				}
-				req.RemoteAddr = r.RemoteAddr // since we're converting the request, need to carry over the original connecting IP as well
-				ctx.Logf("req %v", r.Host)
 
-				if !httpsRegexp.MatchString(req.URL.String()) {
-					req.URL, err = url.Parse("https://" + r.Host + req.URL.String())
-				}
-
-				// Bug fix which goproxy fails to provide request
-				// information URL in the context when does HTTPS MITM
-				ctx.Req = req
-
+				preprocessHttpsRequest(ctx, r, req)
 				req, resp := proxy.filterRequest(req, ctx)
 				if resp == nil {
 					if isWebSocketRequest(req) {
@@ -244,7 +298,11 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						ctx.Warnf("Illegal URL %s", "https://"+r.Host+req.URL.Path)
 						return
 					}
-					removeProxyHeaders(ctx, req)
+
+					if !proxy.KeepHeader {
+						removeProxyHeaders(ctx, req)
+					}
+
 					resp, err = ctx.RoundTrip(req)
 					if err != nil {
 						ctx.Warnf("Cannot read TLS response from mitm'd server %v", err)
