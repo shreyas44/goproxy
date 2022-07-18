@@ -244,8 +244,6 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 
 							resp, err = ctx.RoundTrip(req)
 							if err != nil {
-								ctx.Warnf("warn resp: %v", resp)
-								ctx.Warnf("warn req: %v", ctx.RoundTrip)
 								ctx.Warnf("Cannot read response from mitm'd server %v", err)
 								return
 							}
